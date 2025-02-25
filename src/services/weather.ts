@@ -1,26 +1,19 @@
 import type { WeatherData, FishingCondition, TimelinePoint, TideInfo } from '../types';
 import { getMoonPhase } from './moon';
-import { getCachedData, setCachedData } from './cache';
 
-const WEATHER_API_KEY = import.meta.env.VITE_OPENWEATHER_API_KEY;
+const OPENWEATHER_API_KEY = import.meta.env.VITE_OPENWEATHER_API_KEY;
 const BASE_URL = 'https://api.openweathermap.org/data/2.5';
 
 export async function fetchWeatherData(lat: number, lon: number) {
-  if (!WEATHER_API_KEY) {
+  if (!OPENWEATHER_API_KEY) {
     throw new Error('OpenWeather API key is not configured');
-  }
-
-  // Check cache first
-  const cachedData = getCachedData('weather', { latitude: lat, longitude: lon });
-  if (cachedData) {
-    return cachedData;
   }
 
   try {
     // Get current weather and forecast in parallel
     const [currentResponse, forecastResponse] = await Promise.all([
       fetch(
-        `${BASE_URL}/weather?lat=${lat}&lon=${lon}&appid=${WEATHER_API_KEY}&units=imperial`,
+        `${BASE_URL}/weather?lat=${lat}&lon=${lon}&appid=${OPENWEATHER_API_KEY}&units=imperial`,
         { 
           headers: { 
             'Accept': 'application/json',
@@ -29,7 +22,7 @@ export async function fetchWeatherData(lat: number, lon: number) {
         }
       ),
       fetch(
-        `${BASE_URL}/forecast?lat=${lat}&lon=${lon}&appid=${WEATHER_API_KEY}&units=imperial`,
+        `${BASE_URL}/forecast?lat=${lat}&lon=${lon}&appid=${OPENWEATHER_API_KEY}&units=imperial`,
         { 
           headers: { 
             'Accept': 'application/json',
@@ -69,15 +62,10 @@ export async function fetchWeatherData(lat: number, lon: number) {
       throw new Error('Invalid weather data received');
     }
 
-    const weatherData = {
+    return {
       current: currentData,
       forecast: forecastData
     };
-
-    // Cache the successful response
-    setCachedData('weather', { latitude: lat, longitude: lon }, weatherData);
-
-    return weatherData;
   } catch (error: any) {
     if (error instanceof TypeError || error.name === 'TypeError') {
       throw new Error('Network error - please check your connection');
@@ -191,7 +179,7 @@ export function generateForecastTimeline(weatherData: any, tideData: TideInfo | 
 
     // Process current weather with safe fallbacks
     const currentWeather: WeatherData = {
-      windSpeed: weatherData.current.wind?.speed || 0,
+      windSpeed: weatherData.current.wind?.speed || 0, // Already in mph from API
       windDirection: getWindDirection(weatherData.current.wind?.deg),
       temperature: weatherData.current.main?.temp || 0,
       precipitation: weatherData.current.rain ? 100 : 0,
@@ -199,11 +187,12 @@ export function generateForecastTimeline(weatherData: any, tideData: TideInfo | 
       pressure: weatherData.current.main?.pressure || 1013
     };
 
+    const currentTime = new Date(weatherData.current.dt * 1000);
+    const currentMoonPhase = getMoonPhase(currentTime);
     const currentScore = calculateFishingScore(currentWeather, tideData);
-    const currentMoonPhase = getMoonPhase(new Date(weatherData.current.dt * 1000));
     
     points.push({
-      timestamp: new Date(weatherData.current.dt * 1000),
+      timestamp: currentTime,
       score: currentScore,
       condition: determineCondition(currentScore),
       weather: currentWeather,

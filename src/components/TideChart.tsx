@@ -4,7 +4,7 @@ import { Waves } from 'lucide-react';
 import type { TideInfo } from '../types';
 
 interface TideChartProps {
-  tide: TideInfo & { rawData?: any };
+  tide: TideInfo;
   onClose: () => void;
 }
 
@@ -24,99 +24,116 @@ export function TideChart({ tide, onClose }: TideChartProps) {
   const [hoveredPoint, setHoveredPoint] = useState<TidePoint | null>(null);
 
   const { points, pathD, yAxisLabels, xAxisLabels } = useMemo(() => {
-    if (!tide.rawData?.data?.weather) {
+    // Early return if no raw data is available
+    if (!tide?.rawData?.data?.weather) {
+      console.warn('No tide data available for chart');
       return { points: [], pathD: '', yAxisLabels: [], xAxisLabels: [] };
     }
 
     const now = new Date();
     const points: { time: Date; height: number; type?: string }[] = [];
 
-    // Process tide data from all available weather days
-    tide.rawData.data.weather.forEach((day: any) => {
-      if (day?.tides?.[0]?.tide_data) {
-        day.tides[0].tide_data.forEach((tidePoint: any) => {
-          const time = new Date(tidePoint.tideDateTime);
-          const height = parseFloat(tidePoint.tideHeight_mt);
+    try {
+      // Process tide data from all available weather days
+      tide.rawData.data.weather.forEach((day: any) => {
+        if (day?.tides?.[0]?.tide_data) {
+          day.tides[0].tide_data.forEach((tidePoint: any) => {
+            try {
+              const time = new Date(tidePoint.tideDateTime);
+              const height = parseFloat(tidePoint.tideHeight_mt);
 
-          // Only include points within the next 48 hours
-          if (!isNaN(height) && 
-              time >= now && 
-              time <= new Date(now.getTime() + 48 * 60 * 60 * 1000)) {
-            points.push({
-              time,
-              height,
-              type: tidePoint.tide_type.toUpperCase()
-            });
-          }
+              // Validate the parsed values
+              if (isNaN(time.getTime()) || isNaN(height)) {
+                console.warn('Invalid tide point data:', { tidePoint, time, height });
+                return;
+              }
+
+              // Only include points within the next 48 hours
+              if (time >= now && time <= new Date(now.getTime() + 48 * 60 * 60 * 1000)) {
+                points.push({
+                  time,
+                  height,
+                  type: tidePoint.tide_type?.toUpperCase()
+                });
+              }
+            } catch (error) {
+              console.warn('Error processing tide point:', error);
+            }
+          });
+        }
+      });
+
+      // Sort points by time
+      points.sort((a, b) => a.time.getTime() - b.time.getTime());
+
+      // Add current point if not already included
+      if (points.length > 0 && points[0].time > now) {
+        points.unshift({
+          time: now,
+          height: tide.height,
+          type: 'CURRENT'
         });
       }
-    });
 
-    // Sort points by time
-    points.sort((a, b) => a.time.getTime() - b.time.getTime());
+      if (points.length < 2) {
+        console.warn('Insufficient tide points for chart');
+        return { points: [], pathD: '', yAxisLabels: [], xAxisLabels: [] };
+      }
 
-    // Add current point if not already included
-    if (points.length > 0 && points[0].time > now) {
-      points.unshift({
-        time: now,
-        height: tide.height
+      const maxHeight = Math.max(...points.map(p => p.height));
+      const minHeight = Math.min(...points.map(p => p.height));
+      const heightRange = maxHeight - minHeight;
+
+      // Scale points to graph dimensions
+      const timeRange = points[points.length - 1].time.getTime() - points[0].time.getTime();
+      const xScale = (GRAPH_WIDTH - PADDING * 2) / timeRange;
+      const yScale = (GRAPH_HEIGHT - PADDING * 2) / heightRange;
+
+      const scaledPoints = points.map(point => ({
+        x: PADDING + (point.time.getTime() - points[0].time.getTime()) * xScale,
+        y: GRAPH_HEIGHT - PADDING - (point.height - minHeight) * yScale,
+        ...point
+      }));
+
+      // Create SVG path using cubic bezier curves for smoother lines
+      const pathD = scaledPoints.reduce((path, point, i) => {
+        if (i === 0) return `M ${point.x},${point.y}`;
+        
+        const prev = scaledPoints[i - 1];
+        const cp1x = prev.x + (point.x - prev.x) / 3;
+        const cp2x = prev.x + (point.x - prev.x) * 2 / 3;
+        
+        return `${path} C ${cp1x},${prev.y} ${cp2x},${point.y} ${point.x},${point.y}`;
+      }, '');
+
+      // Generate axis labels
+      const yAxisLabels = Array.from({ length: 5 }, (_, i) => {
+        const height = minHeight + (heightRange * i) / 4;
+        return {
+          value: height.toFixed(1),
+          y: GRAPH_HEIGHT - PADDING - (height - minHeight) * yScale
+        };
       });
-    }
 
-    if (points.length < 2) {
+      // Create hour markers every 3 hours
+      const xAxisLabels = [];
+      const startTime = points[0].time;
+      const endTime = points[points.length - 1].time;
+      
+      for (let time = new Date(startTime); time <= endTime; time = new Date(time.getTime() + 3 * 60 * 60 * 1000)) {
+        xAxisLabels.push({
+          value: format(time, 'ha'),
+          x: PADDING + (time.getTime() - startTime.getTime()) * xScale,
+          isMainLabel: time.getHours() % 12 === 0,
+          date: format(time, 'MMM d')
+        });
+      }
+
+      return { points: scaledPoints, pathD, yAxisLabels, xAxisLabels };
+    } catch (error) {
+      console.error('Error generating tide chart:', error);
       return { points: [], pathD: '', yAxisLabels: [], xAxisLabels: [] };
     }
-
-    const maxHeight = Math.max(...points.map(p => p.height));
-    const minHeight = Math.min(...points.map(p => p.height));
-    const heightRange = maxHeight - minHeight;
-
-    // Scale points to graph dimensions
-    const timeRange = points[points.length - 1].time.getTime() - points[0].time.getTime();
-    const xScale = (GRAPH_WIDTH - PADDING * 2) / timeRange;
-    const yScale = (GRAPH_HEIGHT - PADDING * 2) / heightRange;
-
-    const scaledPoints = points.map(point => ({
-      x: PADDING + (point.time.getTime() - points[0].time.getTime()) * xScale,
-      y: GRAPH_HEIGHT - PADDING - (point.height - minHeight) * yScale,
-      ...point
-    }));
-
-    // Create SVG path using cubic bezier curves for smoother lines
-    const pathD = scaledPoints.reduce((path, point, i) => {
-      if (i === 0) return `M ${point.x},${point.y}`;
-      
-      const prev = scaledPoints[i - 1];
-      const cp1x = prev.x + (point.x - prev.x) / 3;
-      const cp2x = prev.x + (point.x - prev.x) * 2 / 3;
-      
-      return `${path} C ${cp1x},${prev.y} ${cp2x},${point.y} ${point.x},${point.y}`;
-    }, '');
-
-    // Generate axis labels
-    const yAxisLabels = Array.from({ length: 5 }, (_, i) => {
-      const height = minHeight + (heightRange * i) / 4;
-      return {
-        value: height.toFixed(1),
-        y: GRAPH_HEIGHT - PADDING - (height - minHeight) * yScale
-      };
-    });
-
-    // Create hour markers every 3 hours
-    const xAxisLabels = [];
-    const startTime = points[0].time;
-    const endTime = points[points.length - 1].time;
-    
-    for (let time = new Date(startTime); time <= endTime; time = new Date(time.getTime() + 3 * 60 * 60 * 1000)) {
-      xAxisLabels.push({
-        value: format(time, 'ha'),
-        x: PADDING + (time.getTime() - startTime.getTime()) * xScale,
-        isMainLabel: time.getHours() % 12 === 0,
-        date: format(time, 'MMM d')
-      });
-    }
-
-    return { points: scaledPoints, pathD, yAxisLabels, xAxisLabels };
   }, [tide]);
 
   if (!points.length) {

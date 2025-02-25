@@ -1,14 +1,7 @@
 import type { Coordinates, TideInfo } from '../types';
 import { getCachedData, setCachedData } from './cache';
 
-const MARINE_API_KEY = import.meta.env.VITE_MARINE_API_KEY;
-const MARINE_API_URL = 'https://api.worldweatheronline.com/premium/v1/marine.ashx';
-
 export async function getTideData(coordinates: Coordinates): Promise<{ data: TideInfo | null; raw: any }> {
-  if (!MARINE_API_KEY) {
-    throw new Error('Marine API key is not configured');
-  }
-
   // Check cache first
   const cachedData = getCachedData<{ data: TideInfo | null; raw: any }>('tide', coordinates);
   if (cachedData) {
@@ -16,31 +9,25 @@ export async function getTideData(coordinates: Coordinates): Promise<{ data: Tid
   }
 
   try {
-    const formattedCoords = `${coordinates.latitude.toFixed(6)},${coordinates.longitude.toFixed(6)}`;
-    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+
     const response = await fetch(
-      `${MARINE_API_URL}?key=${MARINE_API_KEY}&q=${formattedCoords}&format=json&tide=yes&tp=1`,
+      `/api/marine?lat=${coordinates.latitude}&lon=${coordinates.longitude}`,
       {
         headers: {
           'Accept': 'application/json',
           'User-Agent': 'FishingConditionsApp/1.0'
-        }
+        },
+        signal: controller.signal
       }
     );
 
+    clearTimeout(timeoutId);
+
     if (!response.ok) {
-      if (response.status === 401) {
-        throw new Error('Invalid Marine API key');
-      }
-      if (response.status === 429) {
-        throw new Error('Marine API rate limit exceeded');
-      }
-      
       const errorData = await response.json().catch(() => ({}));
-      throw new Error(
-        errorData.error?.[0]?.msg || 
-        `Marine service error (${response.status})`
-      );
+      throw new Error(errorData.error || 'Marine service error');
     }
 
     const rawData = await response.json();
@@ -52,7 +39,7 @@ export async function getTideData(coordinates: Coordinates): Promise<{ data: Tid
       return result;
     }
 
-    // Get today's and tomorrow's tide data
+    // Process tide data from all available weather days
     const todayTides = rawData.data.weather[0]?.tides?.[0]?.tide_data || [];
     const tomorrowTides = rawData.data.weather[1]?.tides?.[0]?.tide_data || [];
     
@@ -97,10 +84,19 @@ export async function getTideData(coordinates: Coordinates): Promise<{ data: Tid
 
     return result;
   } catch (error: any) {
-    if (error instanceof TypeError || error.name === 'TypeError') {
-      throw new Error('Network error - please check your connection');
+    // Handle specific error types
+    if (error.name === 'AbortError') {
+      console.warn('Marine API request timed out');
+      return { data: null, raw: { error: 'Request timed out' } };
     }
-    throw error;
+    
+    if (error instanceof TypeError || error.name === 'TypeError') {
+      console.warn('Marine API network error:', error);
+      return { data: null, raw: { error: 'Network error' } };
+    }
+
+    console.error('Marine API error:', error);
+    return { data: null, raw: { error: error.message } };
   }
 }
 
