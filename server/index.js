@@ -5,7 +5,6 @@ import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fetch from 'node-fetch';
-import https from 'https';
 import { Agent } from 'https';
 
 // Load environment variables
@@ -16,10 +15,23 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 // Configure CORS with specific origins
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:4173',
+  'https://fishing-forecast-seven.vercel.app',
+  'https://fishing-forecast.vercel.app'
+];
+
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' 
-    ? ['https://fishing-forecast-seven.vercel.app'] 
-    : ['http://localhost:5173', 'http://localhost:4173'],
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) === -1) {
+      return callback(new Error('CORS not allowed'), false);
+    }
+    return callback(null, true);
+  },
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
@@ -42,55 +54,45 @@ const httpsAgent = new Agent({
 const apiCache = new Map();
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
-// Rate limiting with more lenient settings for development
+// Rate limiting middleware with custom key generator
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: process.env.NODE_ENV === 'production' ? 100 : 1000,
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => process.env.NODE_ENV === 'development',
+  keyGenerator: (req) => {
+    // Use X-Forwarded-For header first (for proxied requests)
+    const xForwardedFor = req.headers['x-forwarded-for'];
+    if (xForwardedFor) {
+      const ips = xForwardedFor.split(',').map(ip => ip.trim());
+      return ips[0];
+    }
+    // Fallback to other possible IP sources
+    return req.ip || 
+           req.connection?.remoteAddress || 
+           req.socket?.remoteAddress || 
+           'unknown';
+  },
   handler: (req, res) => {
     res.status(429).json({
       error: 'Too many requests, please try again later.',
       retryAfter: Math.ceil(req.rateLimit.resetTime / 1000)
     });
-  },
-  keyGenerator: (req) => {
-    return process.env.NODE_ENV === 'development' 
-      ? '127.0.0.1' 
-      : req.ip || req.connection.remoteAddress;
   }
 });
 
-// Apply rate limiting to API routes only
+// Apply rate limiting to API routes
 app.use('/api', limiter);
 
-// Enhanced fetch with retries and circuit breaker
-const circuitBreaker = {
-  failures: 0,
-  lastFailure: 0,
-  isOpen: false,
-  threshold: 5,
-  resetTimeout: 30000 // 30 seconds
-};
-
+// Enhanced fetch with retries and timeouts
 async function fetchWithRetry(url, options, retries = 3) {
-  // Check circuit breaker
-  if (circuitBreaker.isOpen) {
-    const now = Date.now();
-    if (now - circuitBreaker.lastFailure > circuitBreaker.resetTimeout) {
-      circuitBreaker.isOpen = false;
-      circuitBreaker.failures = 0;
-    } else {
-      throw new Error('Circuit breaker is open');
-    }
-  }
-
   let lastError;
+  
   for (let i = 0; i < retries; i++) {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
 
       const response = await fetch(url, {
         ...options,
@@ -107,48 +109,22 @@ async function fetchWithRetry(url, options, retries = 3) {
 
       clearTimeout(timeoutId);
 
-      if (controller.signal.aborted) {
-        throw new Error('Request timed out');
-      }
-
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const data = await response.json();
-      
-      // Reset circuit breaker on success
-      circuitBreaker.failures = 0;
-      circuitBreaker.isOpen = false;
-
-      return { response, data };
+      return await response.json();
     } catch (error) {
       lastError = error;
       
-      // Update circuit breaker
-      circuitBreaker.failures++;
-      circuitBreaker.lastFailure = Date.now();
-      if (circuitBreaker.failures >= circuitBreaker.threshold) {
-        circuitBreaker.isOpen = true;
-        throw new Error('Circuit breaker triggered');
-      }
-
-      const isLastAttempt = i === retries - 1;
-      const isNetworkError = error.code === 'ECONNRESET' || 
-                            error.code === 'ECONNREFUSED' ||
-                            error.code === 'ETIMEDOUT';
-
-      if (isLastAttempt) {
+      if (i === retries - 1) {
         throw error;
       }
 
-      // Exponential backoff with jitter
-      const delay = Math.min(1000 * Math.pow(2, i) + Math.random() * 1000, 10000);
-      await new Promise(resolve => setTimeout(resolve, delay));
-
-      if (isNetworkError) {
-        console.warn(`Network error (${error.code}), retrying...`);
-      }
+      // Exponential backoff
+      await new Promise(resolve => 
+        setTimeout(resolve, Math.min(1000 * Math.pow(2, i), 10000))
+      );
     }
   }
 
@@ -177,7 +153,7 @@ function cacheMiddleware(duration) {
   };
 }
 
-// Marine API endpoint with caching
+// Marine API endpoint
 app.get('/api/marine', cacheMiddleware(CACHE_DURATION), async (req, res) => {
   try {
     const { lat, lon } = req.query;
@@ -193,71 +169,34 @@ app.get('/api/marine', cacheMiddleware(CACHE_DURATION), async (req, res) => {
     const coords = `${lat},${lon}`;
     const url = `https://api.worldweatheronline.com/premium/v1/marine.ashx?key=${process.env.VITE_MARINE_API_KEY}&q=${coords}&format=json&tide=yes&tp=1`;
 
-    const { data } = await fetchWithRetry(url, {
+    const data = await fetchWithRetry(url, {
       headers: {
         'Accept': 'application/json',
         'User-Agent': 'FishingConditionsApp/1.0'
       }
     });
 
-    if (!data?.data?.weather) {
-      throw new Error('Invalid response format from Marine API');
-    }
-
     res.json(data);
   } catch (error) {
-    console.error('Marine API error:', {
-      message: error.message,
-      code: error.code,
-      type: error.name
-    });
+    console.error('Marine API error:', error);
     
-    let statusCode = 500;
-    let errorResponse = {
+    res.status(500).json({
       error: 'Failed to fetch marine data',
-      retry: true
-    };
-
-    if (error.message === 'Circuit breaker is open') {
-      statusCode = 503;
-      errorResponse.error = 'Service temporarily unavailable';
-      errorResponse.retryAfter = Math.ceil(circuitBreaker.resetTimeout / 1000);
-    } else if (error.name === 'AbortError') {
-      statusCode = 504;
-      errorResponse.error = 'Request timed out';
-    } else if (error.code === 'ECONNRESET' || error.code === 'ECONNREFUSED') {
-      statusCode = 503;
-      errorResponse.error = 'Connection failed';
-    }
-
-    if (process.env.NODE_ENV === 'development') {
-      errorResponse.details = error.message;
-    }
-
-    res.status(statusCode).json(errorResponse);
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  const health = {
-    status: 'ok',
-    timestamp: new Date(),
-    circuitBreaker: {
-      status: circuitBreaker.isOpen ? 'open' : 'closed',
-      failures: circuitBreaker.failures
-    }
-  };
-  res.json(health);
+  res.json({ status: 'ok', timestamp: new Date() });
 });
 
-// Development proxy
-if (process.env.NODE_ENV !== 'production') {
-  app.get('*', (req, res) => {
-    res.redirect(`http://localhost:5173${req.path}`);
-  });
-} else {
+// Serve static files in production
+if (process.env.NODE_ENV === 'production') {
   app.use(express.static(join(__dirname, '../dist')));
+  
+  // Handle client-side routing
   app.get('*', (req, res) => {
     res.sendFile(join(__dirname, '../dist/index.html'));
   });

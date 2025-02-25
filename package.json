@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "concurrently \"vite\" \"node server/index.js\"",
     "build": "tsc && vite build",
+    "vercel-build": "tsc && vite build",
     "start": "node server/index.js",
     "lint": "eslint .",
     "preview": "vite preview"
