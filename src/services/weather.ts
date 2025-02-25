@@ -1,19 +1,12 @@
 import type { WeatherData, FishingCondition, TimelinePoint, TideInfo } from '../types';
 import { getMoonPhase } from './moon';
 
-const OPENWEATHER_API_KEY = import.meta.env.VITE_OPENWEATHER_API_KEY;
-const BASE_URL = 'https://api.openweathermap.org/data/2.5';
-
 export async function fetchWeatherData(lat: number, lon: number) {
-  if (!OPENWEATHER_API_KEY) {
-    throw new Error('OpenWeather API key is not configured');
-  }
-
   try {
     // Get current weather and forecast in parallel
     const [currentResponse, forecastResponse] = await Promise.all([
       fetch(
-        `${BASE_URL}/weather?lat=${lat}&lon=${lon}&appid=${OPENWEATHER_API_KEY}&units=imperial`,
+        `/api/weather/current?lat=${lat}&lon=${lon}`,
         { 
           headers: { 
             'Accept': 'application/json',
@@ -22,7 +15,7 @@ export async function fetchWeatherData(lat: number, lon: number) {
         }
       ),
       fetch(
-        `${BASE_URL}/forecast?lat=${lat}&lon=${lon}&appid=${OPENWEATHER_API_KEY}&units=imperial`,
+        `/api/weather/forecast?lat=${lat}&lon=${lon}`,
         { 
           headers: { 
             'Accept': 'application/json',
@@ -35,19 +28,8 @@ export async function fetchWeatherData(lat: number, lon: number) {
     // Handle API errors
     for (const response of [currentResponse, forecastResponse]) {
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        
-        if (response.status === 401) {
-          throw new Error('Invalid OpenWeather API key');
-        }
-        if (response.status === 429) {
-          throw new Error('Weather API rate limit exceeded');
-        }
-        
-        throw new Error(
-          errorData.message || 
-          `Weather service error (${response.status})`
-        );
+        const errorData = await response.json();
+        throw new Error(errorData.error || `Weather service error (${response.status})`);
       }
     }
 
@@ -67,6 +49,7 @@ export async function fetchWeatherData(lat: number, lon: number) {
       forecast: forecastData
     };
   } catch (error: any) {
+    console.error('Weather API error:', error);
     if (error instanceof TypeError || error.name === 'TypeError') {
       throw new Error('Network error - please check your connection');
     }
@@ -179,7 +162,7 @@ export function generateForecastTimeline(weatherData: any, tideData: TideInfo | 
 
     // Process current weather with safe fallbacks
     const currentWeather: WeatherData = {
-      windSpeed: weatherData.current.wind?.speed || 0, // Already in mph from API
+      windSpeed: weatherData.current.wind?.speed || 0,
       windDirection: getWindDirection(weatherData.current.wind?.deg),
       temperature: weatherData.current.main?.temp || 0,
       precipitation: weatherData.current.rain ? 100 : 0,

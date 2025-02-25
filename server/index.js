@@ -14,27 +14,23 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Configure CORS with specific origins
-const allowedOrigins = [
-  'http://localhost:5173',
-  'http://localhost:4173',
-  'https://fishing-forecast-seven.vercel.app',
-  'https://fishing-forecast.vercel.app'
-];
-
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.indexOf(origin) === -1) {
-      return callback(new Error('CORS not allowed'), false);
+// Simplified CORS configuration
+const corsOptions = process.env.NODE_ENV === 'production' 
+  ? {
+      origin: [
+        'https://fishing-forecast-seven.vercel.app',
+        'https://fishing-forecast.vercel.app',
+        'http://localhost:5173'
+      ],
+      methods: ['GET', 'POST', 'OPTIONS'],
+      credentials: true
     }
-    return callback(null, true);
-  },
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+  : {
+      origin: true, // Allow all origins in development
+      credentials: true
+    };
+
+app.use(cors(corsOptions));
 
 // Trust first proxy if behind a reverse proxy
 app.set('trust proxy', 1);
@@ -54,7 +50,7 @@ const httpsAgent = new Agent({
 const apiCache = new Map();
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
-// Rate limiting middleware with custom key generator
+// Rate limiting middleware
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: process.env.NODE_ENV === 'production' ? 100 : 1000,
@@ -62,23 +58,9 @@ const limiter = rateLimit({
   legacyHeaders: false,
   skip: (req) => process.env.NODE_ENV === 'development',
   keyGenerator: (req) => {
-    // Use X-Forwarded-For header first (for proxied requests)
-    const xForwardedFor = req.headers['x-forwarded-for'];
-    if (xForwardedFor) {
-      const ips = xForwardedFor.split(',').map(ip => ip.trim());
-      return ips[0];
-    }
-    // Fallback to other possible IP sources
-    return req.ip || 
-           req.connection?.remoteAddress || 
-           req.socket?.remoteAddress || 
+    return req.headers['x-forwarded-for']?.split(',')[0].trim() || 
+           req.ip || 
            'unknown';
-  },
-  handler: (req, res) => {
-    res.status(429).json({
-      error: 'Too many requests, please try again later.',
-      retryAfter: Math.ceil(req.rateLimit.resetTime / 1000)
-    });
   }
 });
 
@@ -109,11 +91,18 @@ async function fetchWithRetry(url, options, retries = 3) {
 
       clearTimeout(timeoutId);
 
+      const data = await response.json();
+
+      // Check for OpenWeather API specific error format
+      if (data.cod && data.cod !== 200 && data.cod !== '200') {
+        throw new Error(data.message || `API Error: ${data.cod}`);
+      }
+
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      return await response.json();
+      return data;
     } catch (error) {
       lastError = error;
       
@@ -153,6 +142,79 @@ function cacheMiddleware(duration) {
   };
 }
 
+// OpenWeather API endpoints
+app.get('/api/weather/current', cacheMiddleware(CACHE_DURATION), async (req, res) => {
+  try {
+    const { lat, lon } = req.query;
+    
+    if (!lat || !lon) {
+      return res.status(400).json({ error: 'Missing latitude or longitude' });
+    }
+
+    if (!process.env.VITE_OPENWEATHER_API_KEY) {
+      return res.status(500).json({ error: 'OpenWeather API key not configured' });
+    }
+
+    const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${process.env.VITE_OPENWEATHER_API_KEY}&units=imperial`;
+
+    const data = await fetchWithRetry(url, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'FishingConditionsApp/1.0'
+      }
+    });
+
+    // Validate the response structure
+    if (!data.main || !data.wind || !data.clouds) {
+      throw new Error('Invalid weather data format received');
+    }
+
+    res.json(data);
+  } catch (error) {
+    console.error('Weather API error:', error);
+    
+    res.status(error.message.includes('401') ? 401 : 500).json({
+      error: error.message || 'Failed to fetch weather data'
+    });
+  }
+});
+
+app.get('/api/weather/forecast', cacheMiddleware(CACHE_DURATION), async (req, res) => {
+  try {
+    const { lat, lon } = req.query;
+    
+    if (!lat || !lon) {
+      return res.status(400).json({ error: 'Missing latitude or longitude' });
+    }
+
+    if (!process.env.VITE_OPENWEATHER_API_KEY) {
+      return res.status(500).json({ error: 'OpenWeather API key not configured' });
+    }
+
+    const url = `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&appid=${process.env.VITE_OPENWEATHER_API_KEY}&units=imperial`;
+
+    const data = await fetchWithRetry(url, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'FishingConditionsApp/1.0'
+      }
+    });
+
+    // Validate the response structure
+    if (!data.list || !Array.isArray(data.list)) {
+      throw new Error('Invalid forecast data format received');
+    }
+
+    res.json(data);
+  } catch (error) {
+    console.error('Weather API error:', error);
+    
+    res.status(error.message.includes('401') ? 401 : 500).json({
+      error: error.message || 'Failed to fetch forecast data'
+    });
+  }
+});
+
 // Marine API endpoint
 app.get('/api/marine', cacheMiddleware(CACHE_DURATION), async (req, res) => {
   try {
@@ -176,13 +238,17 @@ app.get('/api/marine', cacheMiddleware(CACHE_DURATION), async (req, res) => {
       }
     });
 
+    // Validate the response structure
+    if (!data.data || !data.data.weather) {
+      throw new Error('Invalid marine data format received');
+    }
+
     res.json(data);
   } catch (error) {
     console.error('Marine API error:', error);
     
-    res.status(500).json({
-      error: 'Failed to fetch marine data',
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    res.status(error.message.includes('401') ? 401 : 500).json({
+      error: error.message || 'Failed to fetch marine data'
     });
   }
 });
@@ -202,12 +268,11 @@ if (process.env.NODE_ENV === 'production') {
   });
 }
 
-// Error handling middleware
+// Global error handler
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  console.error('Server error:', err);
   res.status(500).json({
-    error: 'Internal server error',
-    details: process.env.NODE_ENV === 'development' ? err.message : undefined
+    error: 'Internal server error'
   });
 });
 
